@@ -1,0 +1,7 @@
+# RGB + Radar acquisition requirements
+pyserial>=3.5
+opencv-python>=4.8
+mediapipe>=0.10
+numpy>=1.23
+scipy>=1.13
+pandas>=1.5

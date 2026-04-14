@@ -1,0 +1,22 @@
+# MediaPipe model files (large binaries — re-downloaded automatically)
+*.task
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Recorded sessions
+*.pkl
+*.csv
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
