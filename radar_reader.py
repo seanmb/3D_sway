@@ -168,6 +168,12 @@ class RadarReader:
         self.frames_dropped = 0
         self.parse_errors = 0
 
+        # Person tracker — EMA of the subject's range across frames
+        # NaN until first confident detection; reset after tracker_age_max seconds
+        # without a detection.
+        self._person_y: float = float('nan')   # metres
+        self._person_ts: float = 0.0           # host_ts of last detection
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def start(self) -> None:
@@ -369,8 +375,26 @@ class RadarReader:
             elif tlv_type == TLV_RANGE_DOPPLER:
                 range_doppler = self._parse_range_doppler(tlv_data)
 
-        subject_range_m = self._centroid_range(range_profile) if range_profile is not None \
-                          else float('nan')
+        # ── Detect person, then refine ───────────────────────────────────────
+        # Step 1: cluster CFAR point cloud → identify which range the person
+        #         occupies (angle + Doppler discrimination — rejects static objects).
+        # Step 2: narrow the range-profile centroid to ±0.30 m around that cluster
+        #         → ~5 mm precision without tracking furniture.
+        # Fallback: if no CFAR cluster found, use the full-window range-profile
+        #           centroid (brightest reflector in [RANGE_MIN_M, RANGE_MAX_M]).
+        person_coarse = (self._find_person_cluster(points, host_ts)
+                         if points else float('nan'))
+
+        if range_profile is not None:
+            if np.isfinite(person_coarse):
+                subject_range_m = self._centroid_range(
+                    range_profile, center_m=person_coarse, search_r=0.30)
+            else:
+                subject_range_m = self._centroid_range(range_profile)
+        elif np.isfinite(person_coarse):
+            subject_range_m = person_coarse   # no range profile — use cluster centroid
+        else:
+            subject_range_m = float('nan')
 
         self.frames_received += 1
         return RadarFrame(
@@ -389,18 +413,26 @@ class RadarReader:
         range_res: float = RANGE_RES_M,
         min_r: float = RANGE_MIN_M,
         max_r: float = RANGE_MAX_M,
+        center_m: float | None = None,
+        search_r: float = 0.30,
         half_window: int = 4,
     ) -> float:
         """
         Sub-bin range estimation from log-magnitude range profile.
 
         1. Window the profile to [min_r, max_r].
-        2. Find the peak bin (brightest target = subject).
+           If center_m is given, narrow to [center_m - search_r, center_m + search_r]
+           so we refine around the cluster the person was detected in, not the
+           globally brightest reflector (which may be furniture).
+        2. Find the peak bin (brightest target in window).
         3. Compute a weighted centroid over ±half_window bins around the peak.
 
         Returns subject range in metres with ~5 mm precision,
         or NaN if no target is found in the window.
         """
+        if center_m is not None:
+            min_r = max(min_r, center_m - search_r)
+            max_r = min(max_r, center_m + search_r)
         n = len(range_prof)
         bins = np.arange(n, dtype=np.float64)
         ranges = bins * range_res
@@ -462,6 +494,131 @@ class RadarReader:
         arr = np.frombuffer(data, dtype=np.uint16).astype(np.float32)
         arr = arr[:n_range * n_doppler].reshape(n_range, n_doppler)
         return arr
+
+    # ── Person detection ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _cluster_points(
+        points: list,
+        eps: float = 0.35,
+        min_samples: int = 2,
+    ) -> list:
+        """
+        DBSCAN clustering on CFAR point cloud in the (x, y) plane.
+
+        Returns a list of clusters; each cluster is a list of Point objects.
+        Noise points (DBSCAN label -1) are discarded.
+
+        Uses scipy.spatial.cKDTree — no sklearn dependency.
+        eps controls the neighbourhood radius in metres (~0.35 m comfortably
+        groups reflections from a single person while separating objects ≥0.5 m apart).
+        """
+        n = len(points)
+        if n < min_samples:
+            return []
+
+        try:
+            from scipy.spatial import cKDTree
+        except ImportError:
+            # scipy unavailable — treat all points as one cluster
+            return [list(points)]
+
+        xy = np.array([[p.x, p.y] for p in points], dtype=np.float32)
+        tree = cKDTree(xy)
+        neighbors = tree.query_ball_point(xy, eps)
+
+        labels = np.full(n, -1, dtype=np.int32)
+        cid = 0
+        for i in range(n):
+            if labels[i] != -1:
+                continue
+            if len(neighbors[i]) < min_samples:
+                continue
+            # BFS flood-fill
+            queue = [i]
+            labels[i] = cid
+            while queue:
+                seed = queue.pop()
+                for nb in neighbors[seed]:
+                    if labels[nb] == -1:
+                        labels[nb] = cid
+                        if len(neighbors[nb]) >= min_samples:
+                            queue.append(nb)
+            cid += 1
+
+        clusters = []
+        for c in range(cid):
+            idx = np.where(labels == c)[0]
+            clusters.append([points[i] for i in idx])
+        return clusters
+
+    def _find_person_cluster(
+        self,
+        points: list,
+        host_ts: float,
+        doppler_min: float = 0.04,      # m/s — minimum mean |doppler| to count as "moving"
+        tracker_age_max: float = 2.0,   # s   — forget tracker after this long without detection
+        ema_alpha: float = 0.25,        # EMA weight applied to each new measurement
+    ) -> float:
+        """
+        Identify the person in the CFAR point cloud using clustering + Doppler gating.
+
+        Algorithm
+        ---------
+        1. DBSCAN-cluster the point cloud in (x, y) — separates spatially distinct objects.
+        2. Score each cluster:
+              score = 4.0 × mean(|doppler|)        moving object → likely person
+                    + 0.15 × n_points              more points → larger reflector
+                    + 1.5 × proximity_to_prior      Gaussian proximity to last known range
+        3. Accept the top-scoring cluster if it has Doppler ≥ doppler_min OR a valid prior.
+           (A perfectly still person is held by the tracker; an unknown static blob is rejected.)
+        4. Update an EMA tracker so brief stationary moments (breath-hold, pause) don't
+           lose the lock.
+
+        Returns the person's forward range y (metres), or NaN if person not identified.
+        """
+        clusters = self._cluster_points(points)
+        if not clusters:
+            return float('nan')
+
+        tracker_valid = (np.isfinite(self._person_y) and
+                         (host_ts - self._person_ts) < tracker_age_max)
+
+        best_score = -1.0
+        best_y = float('nan')
+        best_dop = 0.0
+
+        for cluster in clusters:
+            ys   = np.array([p.y           for p in cluster], dtype=np.float64)
+            dops = np.array([abs(p.doppler) for p in cluster], dtype=np.float64)
+            cy       = float(ys.mean())
+            mean_dop = float(dops.mean())
+            n_pts    = len(cluster)
+
+            # Gaussian proximity bonus: σ = 0.5 m (full weight at same location,
+            # half-weight at ~0.59 m, near-zero beyond 1.5 m)
+            prox = (float(np.exp(-((cy - self._person_y) ** 2) / 0.5))
+                    if tracker_valid else 0.0)
+
+            score = mean_dop * 4.0 + n_pts * 0.15 + prox * 1.5
+            if score > best_score:
+                best_score = score
+                best_y = cy
+                best_dop = mean_dop
+
+        # Reject if static AND no prior (can't identify person among furniture)
+        if best_dop < doppler_min and not tracker_valid:
+            logger.debug("Person detection: all clusters static and no prior — skipping")
+            return float('nan')
+
+        # Update EMA tracker
+        if tracker_valid:
+            self._person_y = (1.0 - ema_alpha) * self._person_y + ema_alpha * best_y
+        else:
+            self._person_y = best_y   # cold start — take first moving cluster as truth
+        self._person_ts = host_ts
+
+        return float(self._person_y)
 
     def _enqueue(self, frame: RadarFrame) -> None:
         try:
