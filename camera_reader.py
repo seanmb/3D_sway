@@ -407,12 +407,10 @@ class CameraReader:
         hip_y_mid  = (lh_y + rh_y) / 2.0
         ls_y = landmarks['left_shoulder'][1]
         rs_y = landmarks['right_shoulder'][1]
-        upper_y_pts = [ls_y, rs_y]
-        if landmarks['left_ear'][3]  >= _VIS_THRESHOLD:
-            upper_y_pts.append(landmarks['left_ear'][1])
-        if landmarks['right_ear'][3] >= _VIS_THRESHOLD:
-            upper_y_pts.append(landmarks['right_ear'][1])
-        upper_y_mid = float(np.mean(upper_y_pts))
+        # Use shoulder midpoint only — ears cause large discontinuous jumps when
+        # their visibility toggles (ear_y ≈ shoulder_y - 57 px at 881 px/m), which
+        # at 3× AP gain produces ~20 cm phantom spikes in the AP signal.
+        upper_y_mid = (ls_y + rs_y) / 2.0
         ap_proxy_px = abs(hip_y_mid - upper_y_mid)
 
         com_ml_px, com_y_px = _dempster_com(landmarks)

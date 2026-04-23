@@ -301,8 +301,8 @@ def draw_metrics_strip(ce, path_len, mvelo, calibrated, trial_elapsed, width, he
     panel = np.full((height, width, 3), 12, dtype=np.uint8)
     cv2.line(panel, (0, 0), (width, 0), (60, 60, 60), 2)
 
-    unit_sq = "cm\u00b2" if calibrated else "px\u00b2"
-    unit_l  = "cm"     if calibrated else "px"
+    unit_sq = "cm2" if calibrated else "px2"   # HERSHEY font has no Unicode superscripts
+    unit_l  = "cm"  if calibrated else "px"
 
     entries = [
         ("CE",    f"{ce:.2f} {unit_sq}"       if ce       is not None else "--", (0,   200, 255)),
@@ -754,8 +754,13 @@ def main():
             put_text(canvas, f"AP gain: {ap_gain:.1f}x", (10, 114),   0.4,  (200, 180, 120))
             # AP source indicator
             _r_active = radar_reader is not None and len(radar_ap_history) > 5
+            _r_cfg    = bool(RADAR_CONFIG_PORT and RADAR_DATA_PORT)
             if _r_active:
                 put_text(canvas, "AP: Radar", (10, 132), 0.4, (50, 255, 80))
+            elif _r_cfg and radar_reader is None:
+                put_text(canvas, "AP: Radar FAIL", (10, 132), 0.4, (60, 60, 255))  # red — port error
+            elif _r_cfg and len(radar_ap_history) == 0:
+                put_text(canvas, "AP: Radar wait", (10, 132), 0.4, (60, 200, 255))  # waiting for data
             elif mouse['use_world_z']:
                 put_text(canvas, "AP: WorldZ", (10, 132), 0.4, (50, 200, 255))
             else:
