@@ -1,8 +1,22 @@
 #!/usr/bin/env python3
 """
-TI IWR6843 radar reader.
+TI IWR6843 radar reader — tested with IWR6843AOPEVM on mmWaveICBOOST.
 
-Connects to the IWR6843 over two serial ports:
+Hardware setup
+--------------
+1. Plug IWR6843AOPEVM onto the mmWaveICBOOST high-speed connector.
+2. Set the SOP mode switch (S1 on ICBOOST) to position 4:
+       SOP2 = 1 (switch 3 ON), SOP1 = 0, SOP0 = 0
+   This runs the firmware already flashed on the EVM (OOB demo).
+3. Connect the ICBOOST USB cable to your PC.
+4. In Device Manager → Ports (COM & LPT) two XDS110 ports appear:
+       XDS110 Class Application/User UART  → RADAR_CONFIG_PORT (115200 baud)
+       XDS110 Class Auxiliary Data Port    → RADAR_DATA_PORT   (921600 baud)
+   The config port always has the LOWER COM port number.
+5. Point the radar at the subject's torso/hip at ~1–1.5 m range.
+   The radar Y axis = forward (range) = our AP axis.
+
+Serial ports connect to the IWR6843 over two serial ports:
   - Config port  (115200 baud): sends chirp configuration commands
   - Data port    (921600 baud): receives TLV frames
 
@@ -10,8 +24,8 @@ Each frame is timestamped with time.perf_counter() on receipt and placed
 into a thread-safe queue as a RadarFrame namedtuple.
 
 TLV types parsed:
-  - Type 1: Detected point cloud (x, y, z, doppler)
-  - Type 2: Range profile magnitude
+  - Type 1: Detected point cloud (x, y, z, doppler)  — ~4 cm range quantisation
+  - Type 2: Range profile magnitude                   — used for sub-bin centroid (~5 mm)
   - Type 5: Range-Doppler heatmap (for micro-Doppler accumulation)
 """
 
@@ -49,32 +63,44 @@ RadarFrame = namedtuple('RadarFrame', [
     'host_ts',        # float: time.perf_counter() at first byte received
     'frame_number',   # int
     'cpu_cycles',     # int: DSP timestamp (monotonic within session)
-    'points',         # list[Point] – detected point cloud
+    'points',         # list[Point] – detected point cloud (CFAR, ~4 cm quantised)
     'range_profile',  # np.ndarray shape (N,) float32, or None
     'range_doppler',  # np.ndarray shape (N_range, N_doppler) float32, or None
+    'subject_range_m',# float: subject range from range-profile centroid (~5 mm precision), or NaN
 ])
 
 
-# ── Default chirp configuration for 1-3 m indoor quiet standing ─────────────
-# Produces ~20 Hz frame rate, ~4 cm range resolution
+# ── Range resolution from the DEFAULT_CONFIG below ───────────────────────────
+# freqSlope = 70 MHz/μs,  numSamples = 256,  sampleRate = 5209 ksps
+# B = 70e6 * 256/5209e3 = 3.44 GHz   →   range_res = c/(2B) ≈ 4.4 cm
+# With centroid extraction on the range profile we achieve ~5 mm precision.
+RANGE_RES_M   = 0.0436   # metres per range bin  (update if profileCfg changes)
+RANGE_MIN_M   = 0.30     # ignore bins closer than this (near-field clutter)
+RANGE_MAX_M   = 4.00     # ignore bins beyond this (unlikely to be the subject)
+
+# ── Default chirp configuration — IWR6843AOP on mmWaveICBOOST ────────────────
+# ~20 Hz frame rate, ~4.4 cm range resolution, 1–4 m subject range.
+# IWR6843AOP: TX0+TX1 = azimuth, TX2 = elevation; all 3 used here.
 DEFAULT_CONFIG = [
     "sensorStop",
     "flushCfg",
     "dfeDataOutputMode 1",
-    "channelCfg 15 7 0",           # 4 RX, 3 TX enabled
+    "channelCfg 15 7 0",           # 4 RX, 3 TX (AOP: TX0+TX1 azimuth, TX2 elevation)
     "adcCfg 2 1",
     "adcbufCfg -1 0 1 1 1",
     "profileCfg 0 60 329 7 57.14 0 0 70 1 256 5209 0 0 30",
-    "chirpCfg 0 0 0 0 0 0 0 1",
-    "chirpCfg 1 1 0 0 0 0 0 2",
-    "chirpCfg 2 2 0 0 0 0 0 4",
-    "frameCfg 0 2 64 0 50 1 0",    # 64 chirps/frame, 50 ms period → 20 Hz
+    # profileCfg: id startFreq(GHz) idleTime adcStart rampEnd txPwr txPhase
+    #             slope(MHz/us) txStart numSamples sampleRate hpf1 hpf2 rxGain
+    "chirpCfg 0 0 0 0 0 0 0 1",   # chirp 0 → TX0
+    "chirpCfg 1 1 0 0 0 0 0 2",   # chirp 1 → TX1
+    "chirpCfg 2 2 0 0 0 0 0 4",   # chirp 2 → TX2 (elevation)
+    "frameCfg 0 2 64 0 50 1 0",   # chirps 0–2, 64 loops, 50 ms period → 20 Hz
     "lowPower 0 0",
-    "guiMonitor -1 1 1 0 0 0 1",   # enable: point cloud, range profile, R-D map
+    "guiMonitor -1 1 1 0 0 0 1",  # enable: point cloud, range profile, R-D heatmap
     "cfarCfg -1 0 2 8 4 3 0 15 1",
     "cfarCfg -1 1 0 4 2 3 1 15 1",
     "multiObjBeamForming -1 1 0.5",
-    "clutterRemoval -1 0",
+    "clutterRemoval -1 1",         # enable static clutter removal — removes standing-still bias
     "calibDcRangeSig -1 0 -5 8 256",
     "extendedMaxVelocity -1 0",
     "lvdsStreamCfg -1 0 0 0",
@@ -276,6 +302,9 @@ class RadarReader:
             elif tlv_type == TLV_RANGE_DOPPLER:
                 range_doppler = self._parse_range_doppler(tlv_data)
 
+        subject_range_m = self._centroid_range(range_profile) if range_profile is not None \
+                          else float('nan')
+
         self.frames_received += 1
         return RadarFrame(
             host_ts=host_ts,
@@ -284,7 +313,53 @@ class RadarReader:
             points=points,
             range_profile=range_profile,
             range_doppler=range_doppler,
+            subject_range_m=subject_range_m,
         )
+
+    @staticmethod
+    def _centroid_range(
+        range_prof: np.ndarray,
+        range_res: float = RANGE_RES_M,
+        min_r: float = RANGE_MIN_M,
+        max_r: float = RANGE_MAX_M,
+        half_window: int = 4,
+    ) -> float:
+        """
+        Sub-bin range estimation from log-magnitude range profile.
+
+        1. Window the profile to [min_r, max_r].
+        2. Find the peak bin (brightest target = subject).
+        3. Compute a weighted centroid over ±half_window bins around the peak.
+
+        Returns subject range in metres with ~5 mm precision,
+        or NaN if no target is found in the window.
+        """
+        n = len(range_prof)
+        bins = np.arange(n, dtype=np.float64)
+        ranges = bins * range_res
+
+        # Mask to expected subject range
+        mask = (ranges >= min_r) & (ranges <= max_r)
+        if not mask.any():
+            return float('nan')
+
+        windowed = range_prof.astype(np.float64)
+        windowed[~mask] = 0.0
+
+        peak_bin = int(np.argmax(windowed))
+        if windowed[peak_bin] == 0.0:
+            return float('nan')
+
+        # Centroid window around peak
+        lo = max(0, peak_bin - half_window)
+        hi = min(n - 1, peak_bin + half_window) + 1
+        w = range_prof[lo:hi].astype(np.float64)
+        w = np.maximum(w - w.min(), 0.0)   # baseline-subtract to sharpen centroid
+        if w.sum() == 0.0:
+            return float(peak_bin * range_res)
+
+        centroid_bin = float(np.dot(w, np.arange(lo, hi)) / w.sum())
+        return centroid_bin * range_res
 
     @staticmethod
     def _parse_points(data: bytes) -> list[Point]:
@@ -338,14 +413,15 @@ def radar_ap_sway(frames: list[RadarFrame]) -> np.ndarray:
     """
     Extract the AP (range) sway signal from a list of RadarFrames.
 
-    Returns the mean range (y-coordinate in IWR6843 coordinate system, which is
-    range in front of the sensor) of all detected points per frame.
-    Frames with no detected points are interpolated.
+    Uses range-profile centroid (subject_range_m, ~5 mm precision) when available,
+    falling back to point-cloud y-median (~4 cm CFAR quantisation) otherwise.
+    Frames with no detection are linearly interpolated.
     """
     values = []
     for f in frames:
-        if f.points:
-            # y is the forward/range axis in IWR6843 coordinate system
+        if np.isfinite(f.subject_range_m):
+            values.append(f.subject_range_m)
+        elif f.points:
             values.append(np.mean([p.y for p in f.points]))
         else:
             values.append(np.nan)

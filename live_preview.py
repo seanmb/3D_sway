@@ -34,7 +34,7 @@ from sensor_fusion import estimate_cop
 logging.basicConfig(level=logging.WARNING)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DEVICE_INDEX      = 0
+DEVICE_INDEX      = 1
 SUBJECT_HEIGHT_M  = 1.70
 HISTORY_S         = 5          # seconds of sway to show in stabilogram
 STAB_SIZE         = 320         # stabilogram panel: square pixels
@@ -43,8 +43,21 @@ ELLIPSE_N_STD     = 1.96        # 95% confidence ellipse
 ELLIPSE_WINDOW_S  = 5.0         # seconds used for ellipse computation
 STAB_AXIS_CM      = 6.0         # half-range of each axis in cm (when px_per_m calibrated)
 STAB_AXIS_PX      = 50          # half-range in pixels (fallback before calibration)
-ASSUMED_HFOV_DEG  = 65.0        # assumed webcam horizontal FOV for AP fudge correction
-METRICS_H         = 200         # height of metrics strip below stabilogram (pixels)
+ASSUMED_HFOV_DEG  = 70.0        # Logitech C922 Pro horizontal FOV (~70 deg at 16:9)
+AP_GAIN           = 3.0         # default AP gain — trunk proxy needs amplification to match ML scale
+DISPLAY_WIDTH     = 640         # canvas display width (capture may be larger)
+
+# ── Radar (IWR6843) ────────────────────────────────────────────────────────────
+# Set both ports to enable radar.  Leave as None to run camera-only.
+# Find ports: Device Manager → Ports (COM & LPT)
+#   XDS110 Class Application/User UART  → RADAR_CONFIG_PORT  (115200 baud)
+#   XDS110 Class Auxiliary Data Port    → RADAR_DATA_PORT    (921600 baud)
+RADAR_CONFIG_PORT = 'COM7'  # XDS110 Application/User UART  (mmWaveICBOOST)
+RADAR_DATA_PORT   = 'COM6'  # XDS110 Auxiliary Data Port     (mmWaveICBOOST)
+
+AUTO_COUNTDOWN_S  = 30          # countdown before auto-trial starts recording
+AUTO_RECORD_S     = 30          # duration of auto-trial recording
+METRICS_H         = 100         # height of metrics strip below stabilogram (pixels)
 METRICS_WINDOW_S  = 5.0         # rolling average window for displayed metrics (seconds)
 
 # ── Skeleton connections ───────────────────────────────────────────────────────
@@ -96,7 +109,6 @@ def draw_skeleton(frame, landmarks):
     }
     pts = {k: (int(v[0]), int(v[1])) for k, v in landmarks.items()}
     idx_to_pt = {v: pts[k] for k, v in name_to_idx.items() if k in pts}
-
     for a, b in SKELETON:
         if a in idx_to_pt and b in idx_to_pt:
             col = LEFT_COLOUR if a in LEFT_INDICES else RIGHT_COLOUR if a in RIGHT_INDICES else MID_COLOUR
@@ -138,15 +150,14 @@ def compute_ellipse(ml, ap):
     return (ew, eh, angle, area)
 
 
-def draw_stabilogram(ml_hist, ap_hist, fps, px_per_m=None, fudge_ap=False, show_cop=False, use_dempster=False, n_std=ELLIPSE_N_STD, trial_elapsed=0.0):
+def draw_stabilogram(ml_hist, ap_hist, ts_hist, fps, px_per_m=None, fudge_ap=False, show_cop=False, use_dempster=False, n_std=ELLIPSE_N_STD, trial_elapsed=0.0):
     """
     Render the stabilogram into a square BGR panel.
     ML = horizontal axis, AP = vertical axis (positive = forward).
 
-    Force-plate-style display:
-      • Both axes converted to cm (isotropic scale) when calibrated.
-      • Fixed axis range (±STAB_AXIS_CM) so the plot doesn't rescale.
-      • Ellipse computed in cm space so its orientation is correct.
+    ml_hist, ap_hist, ts_hist are 1-D numpy arrays of equal length.
+    Windowing and duration are computed from actual timestamps — immune
+    to FPS variation.
     """
     S = STAB_SIZE
     panel = np.full((S, S, 3), 20, dtype=np.uint8)
@@ -155,15 +166,27 @@ def draw_stabilogram(ml_hist, ap_hist, fps, px_per_m=None, fudge_ap=False, show_
     plot_s = S - margin * 2
     half = plot_s / 2.0
 
-    # Display window
-    n_display = max(2, int(HISTORY_S * fps))
-    ml = np.array(list(ml_hist)[-n_display:], dtype=np.float64)
-    ap = np.array(list(ap_hist)[-n_display:], dtype=np.float64)
+    ml_all = np.asarray(ml_hist, dtype=np.float64)
+    ap_all = np.asarray(ap_hist, dtype=np.float64)
+    ts     = np.asarray(ts_hist, dtype=np.float64)
 
-    # Ellipse window — fixed 5 s
-    n_ellipse = max(MIN_ELLIPSE_PTS, int(ELLIPSE_WINDOW_S * fps))
-    ml_ell = np.array(list(ml_hist)[-n_ellipse:], dtype=np.float64)
-    ap_ell = np.array(list(ap_hist)[-n_ellipse:], dtype=np.float64)
+    if len(ts) < 2:
+        cv2.putText(panel, "Collecting...", (margin, S // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (160, 160, 160), 1)
+        return panel, {'ce': None, 'path': 0.0, 'mvelo': 0.0, 'calibrated': False}
+
+    t_end = ts[-1]
+
+    # Time-based display window (last HISTORY_S seconds)
+    disp_mask = ts >= t_end - HISTORY_S
+    ml = ml_all[disp_mask]
+    ap = ap_all[disp_mask]
+    ts_disp = ts[disp_mask]
+
+    # Time-based ellipse window (last ELLIPSE_WINDOW_S seconds, min MIN_ELLIPSE_PTS)
+    ell_mask = ts >= t_end - ELLIPSE_WINDOW_S
+    ml_ell = ml_all[ell_mask]
+    ap_ell = ap_all[ell_mask]
 
     if len(ml) < 2:
         cv2.putText(panel, "Collecting...", (margin, S // 2),
@@ -200,7 +223,7 @@ def draw_stabilogram(ml_hist, ap_hist, fps, px_per_m=None, fudge_ap=False, show_
     if valid_mask.sum() > 1:
         ml_v, ap_v = ml[valid_mask], ap[valid_mask]
         path_length = float(np.sum(np.sqrt(np.diff(ml_v)**2 + np.diff(ap_v)**2)))
-        duration_s  = len(ml) / max(fps, 1.0)
+        duration_s  = float(ts_disp[-1] - ts_disp[0]) if len(ts_disp) > 1 else len(ml) / max(fps, 1.0)
         mvelo       = path_length / max(duration_s, 0.001)
     else:
         path_length = mvelo = 0.0
@@ -313,6 +336,10 @@ BTN3_X1, BTN3_Y1 = STAB_SIZE - 80, 76
 BTN3_X2, BTN3_Y2 = STAB_SIZE - 4,  104
 BTN4_X1, BTN4_Y1 = STAB_SIZE - 80, 110
 BTN4_X2, BTN4_Y2 = STAB_SIZE - 4,  138
+BTN5_X1, BTN5_Y1 = STAB_SIZE - 80, 144
+BTN5_X2, BTN5_Y2 = STAB_SIZE - 4,  172
+BTN6_X1, BTN6_Y1 = STAB_SIZE - 80, 178
+BTN6_X2, BTN6_Y2 = STAB_SIZE - 4,  206
 
 
 def _ap_fudge_factor(px_per_m, image_width, subject_height_m):
@@ -332,7 +359,9 @@ def _ap_fudge_factor(px_per_m, image_width, subject_height_m):
 
 def draw_buttons(panel, hover_reset=False, hover_fudge=False, fudge_active=False,
                   hover_cop=False, cop_active=False,
-                  hover_dempster=False, dempster_active=False):
+                  hover_dempster=False, dempster_active=False,
+                  hover_auto=False, auto_state='idle', auto_countdown=0.0,
+                  hover_world_z=False, world_z_active=False):
     """Draw Reset, AP-fudge, and CoM/CoP toggle buttons."""
     # Reset
     col = (100, 100, 200) if hover_reset else (70, 70, 140)
@@ -373,29 +402,167 @@ def draw_buttons(panel, hover_reset=False, hover_fudge=False, fudge_active=False
     cv2.rectangle(panel, (BTN4_X1, BTN4_Y1), (BTN4_X2, BTN4_Y2), (180, 120, 180), 1)
     cv2.putText(panel, label4, (BTN4_X1 + 14, BTN4_Y2 - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, lcol4, 1, cv2.LINE_AA)
+    # Auto-trial button
+    if auto_state == 'recording':
+        col5, label5, lcol5 = (0, 0, 180) if not hover_auto else (0, 0, 220), "STOP", (100, 100, 255)
+    elif auto_state == 'countdown':
+        col5, label5, lcol5 = (0, 120, 160), f"{int(auto_countdown)+1}s", (0, 230, 255)
+    else:
+        col5, label5, lcol5 = (0, 120, 80) if not hover_auto else (0, 160, 100), "Trial", (100, 255, 180)
+    cv2.rectangle(panel, (BTN5_X1, BTN5_Y1), (BTN5_X2, BTN5_Y2), col5, -1)
+    cv2.rectangle(panel, (BTN5_X1, BTN5_Y1), (BTN5_X2, BTN5_Y2), (80, 220, 160), 1)
+    cv2.putText(panel, label5, (BTN5_X1 + 8, BTN5_Y2 - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, lcol5, 1, cv2.LINE_AA)
+    # World-Z AP toggle
+    if world_z_active:
+        col6, label6, lcol6 = (0, 140, 160) if not hover_world_z else (0, 180, 200), "WorldZ", (100, 230, 255)
+    else:
+        col6, label6, lcol6 = (50, 70, 80) if not hover_world_z else (70, 100, 110), "TrunkL", (160, 190, 200)
+    cv2.rectangle(panel, (BTN6_X1, BTN6_Y1), (BTN6_X2, BTN6_Y2), col6, -1)
+    cv2.rectangle(panel, (BTN6_X1, BTN6_Y1), (BTN6_X2, BTN6_Y2), (80, 180, 200), 1)
+    cv2.putText(panel, label6, (BTN6_X1 + 6, BTN6_Y2 - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, lcol6, 1, cv2.LINE_AA)
+
+
+# ── Landmark order for CSV export ────────────────────────────────────────────
+_LANDMARK_NAMES = [
+    'nose',
+    'left_ear',       'right_ear',
+    'left_shoulder',  'right_shoulder',
+    'left_elbow',     'right_elbow',
+    'left_wrist',     'right_wrist',
+    'left_hip',       'right_hip',
+    'left_knee',      'right_knee',
+    'left_ankle',     'right_ankle',
+    'left_heel',      'right_heel',
+    'left_foot',      'right_foot',
+]
+
+
+def save_recording(frames, px_per_m, radar_ap_hist=None, label='recording'):
+    """
+    Save a list of CameraFrames as .pkl and .csv.
+
+    CSV columns
+    -----------
+    time_s                  — elapsed time in seconds
+    <joint>_x_cm            — landmark x in cm (image left = 0, right = positive)
+    <joint>_y_cm            — landmark y in cm (image top = 0, down = positive)
+    <joint>_z_norm          — MediaPipe normalised z (same scale as x; depth estimate)
+    <joint>_vis             — MediaPipe visibility score [0–1]
+    hip_ml_cm               — hip midpoint ML, negated so right = positive (mirrored)
+    ap_cm                   — AP proxy (trunk length change) in cm
+    ap_radar_cm             — IWR6843 radar range in cm (NaN if radar not connected)
+    com_ml_cm               — Dempster whole-body CoM ML in cm (mirrored)
+    com_y_cm                — Dempster whole-body CoM vertical in cm
+    """
+    if not frames:
+        print("Nothing to save.")
+        return
+
+    ts       = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    pkl_path = f"{label}_{ts}.pkl"
+    csv_path = f"{label}_{ts}.csv"
+
+    # ── Pickle ────────────────────────────────────────────────────────────────
+    with open(pkl_path, 'wb') as f:
+        pickle.dump(frames, f)
+    print(f"Saved pickle → {pkl_path}")
+
+    # ── CSV ───────────────────────────────────────────────────────────────────
+    ppm  = px_per_m or 1.0
+    s2cm = 100.0 / ppm
+    t0   = frames[0].host_ts
+
+    # Build header
+    lm_cols = []
+    for name in _LANDMARK_NAMES:
+        lm_cols += [f"{name}_x_cm", f"{name}_y_cm", f"{name}_z_norm", f"{name}_vis"]
+    header = ['time_s'] + lm_cols + ['hip_ml_cm', 'ap_cm', 'ap_radar_cm', 'com_ml_cm', 'com_y_cm']
+
+    # Pre-interpolate radar AP onto camera timestamps (radar runs at ~20 Hz)
+    frame_ts    = np.array([r.host_ts for r in frames], dtype=np.float64)
+    radar_col   = np.full(len(frames), np.nan)
+    if radar_ap_hist and len(radar_ap_hist) > 2:
+        r_ts   = np.array([t for t, v in radar_ap_hist], dtype=np.float64)
+        r_vals = np.array([v for t, v in radar_ap_hist], dtype=np.float64) * 100.0  # m → cm
+        # Only fill timestamps within the radar recording range
+        in_range = (frame_ts >= r_ts[0]) & (frame_ts <= r_ts[-1])
+        radar_col[in_range] = np.interp(frame_ts[in_range], r_ts, r_vals)
+
+    def _fmt(v):
+        return 'nan' if (v is None or (isinstance(v, float) and np.isnan(v))) else f'{v:.4f}'
+
+    with open(csv_path, 'w', newline='') as csvf:
+        csvf.write(','.join(header) + '\n')
+        for i, rec in enumerate(frames):
+            row = [f'{rec.host_ts - t0:.4f}']
+
+            # All landmark positions
+            lm = rec.landmarks or {}
+            for name in _LANDMARK_NAMES:
+                if name in lm:
+                    x_px, y_px, z_norm, vis = lm[name]
+                    row += [
+                        _fmt(x_px * s2cm if np.isfinite(x_px) else float('nan')),
+                        _fmt(y_px * s2cm if np.isfinite(y_px) else float('nan')),
+                        _fmt(z_norm),
+                        _fmt(vis),
+                    ]
+                else:
+                    row += ['nan', 'nan', 'nan', 'nan']
+
+            # Derived quantities
+            def _cm(v, sign=1):
+                return sign * v * s2cm if np.isfinite(v) else float('nan')
+
+            row += [
+                _fmt(_cm(rec.hip_ml_px, -1)),
+                _fmt(_cm(rec.ap_proxy_px)),
+                _fmt(radar_col[i]),
+                _fmt(_cm(rec.com_ml_px, -1)),
+                _fmt(_cm(rec.com_y_px)),
+            ]
+            csvf.write(','.join(row) + '\n')
+
+    print(f"Saved CSV    → {csv_path}  ({len(frames)} frames, {len(header)} columns)")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     reader = CameraReader(device_index=DEVICE_INDEX, subject_height_m=SUBJECT_HEIGHT_M,
-                          capture_width=640, capture_height=480,
+                          capture_width=1280, capture_height=720,
                           fps=60,
-                          inference_width=320,
+                          inference_width=256,
                           model_type='lite')
-    print("Starting camera... (downloading pose model on first run)")
+    print("Starting camera...")
     reader.start()
 
-    time.sleep(1.5)
+    time.sleep(0.3)
     if reader._thread_error:
         print(f"Camera failed: {reader._thread_error}")
         reader.stop()
         sys.exit(1)
 
-    maxlen = int(HISTORY_S * 35)
-    ml_history_hip = collections.deque(maxlen=maxlen)      # hip midpoint ML
-    ml_history_dempster = collections.deque(maxlen=maxlen)  # Dempster whole-body ML
-    ap_history = collections.deque(maxlen=maxlen)
+    # ── Optional radar reader ─────────────────────────────────────────────────
+    radar_reader = None
+    if RADAR_CONFIG_PORT and RADAR_DATA_PORT:
+        try:
+            from radar_reader import RadarReader
+            radar_reader = RadarReader(RADAR_CONFIG_PORT, RADAR_DATA_PORT)
+            radar_reader.start()
+            print(f"Radar started  cfg={RADAR_CONFIG_PORT}  data={RADAR_DATA_PORT}")
+        except Exception as exc:
+            print(f"Radar not available: {exc}")
+            radar_reader = None
+
+    maxlen = 1000   # enough for ~120fps over 8s — stores (timestamp, value) tuples
+    ml_history_hip = collections.deque(maxlen=maxlen)       # (ts, hip ML px)
+    ml_history_dempster = collections.deque(maxlen=maxlen)  # (ts, Dempster ML px)
+    ap_history = collections.deque(maxlen=maxlen)           # (ts, AP trunk-proxy px)
+    ap_world_history = collections.deque(maxlen=maxlen)     # (ts, world Z in metres)
+    radar_ap_history = collections.deque(maxlen=500)        # (ts, radar range in metres) ~25s @ 20Hz
     frame_times = collections.deque(maxlen=30)
     fps = 30.0
 
@@ -410,7 +577,16 @@ def main():
         'hover_fudge': False, 'fudge_ap': False,
         'hover_cop': False, 'show_cop': False,
         'hover_dempster': False, 'use_dempster': False,
-        'canvas_w': 0,
+        'canvas_w': 0, 'canvas_h': 0,
+        'ap_gain': AP_GAIN,          # live AP gain (0.1 – 20.0)
+        'dragging_ap': False,
+        'hover_auto': False,
+        'auto_state': 'idle',        # 'idle' | 'countdown' | 'recording'
+        'auto_start_ts': 0.0,
+        'hover_world_z': False,
+        'use_world_z': False,        # False = trunk-length proxy, True = MediaPipe world Z
+        # slider bounds updated each frame
+        '_sl_x1': 0, '_sl_x2': 1, '_sl_y1': 0, '_sl_y2': 1,
     }
 
     def on_mouse(event, x, y, flags, param):
@@ -419,7 +595,22 @@ def main():
         param['hover_fudge']    = (BTN2_X1 <= sx <= BTN2_X2 and BTN2_Y1 <= y <= BTN2_Y2)
         param['hover_cop']      = (BTN3_X1 <= sx <= BTN3_X2 and BTN3_Y1 <= y <= BTN3_Y2)
         param['hover_dempster'] = (BTN4_X1 <= sx <= BTN4_X2 and BTN4_Y1 <= y <= BTN4_Y2)
-        if event == cv2.EVENT_LBUTTONDOWN:
+        param['hover_auto']     = (BTN5_X1 <= sx <= BTN5_X2 and BTN5_Y1 <= y <= BTN5_Y2)
+        param['hover_world_z']  = (BTN6_X1 <= sx <= BTN6_X2 and BTN6_Y1 <= y <= BTN6_Y2)
+
+        # AP gain slider (drawn in metrics strip)
+        sl_x1, sl_x2 = param['_sl_x1'], param['_sl_x2']
+        sl_y1, sl_y2 = param['_sl_y1'], param['_sl_y2']
+        in_slider = sl_x1 <= x <= sl_x2 and sl_y1 <= y <= sl_y2
+        if event == cv2.EVENT_LBUTTONDOWN and in_slider:
+            param['dragging_ap'] = True
+        if event == cv2.EVENT_LBUTTONUP:
+            param['dragging_ap'] = False
+        if param['dragging_ap'] and (event in (cv2.EVENT_MOUSEMOVE, cv2.EVENT_LBUTTONDOWN)):
+            t = (x - sl_x1) / max(sl_x2 - sl_x1, 1)
+            param['ap_gain'] = round(max(0.1, min(20.0, t * 20.0)), 1)
+
+        if event == cv2.EVENT_LBUTTONDOWN and not in_slider:
             if param['hover_reset']:
                 param['reset'] = True
             if param['hover_fudge']:
@@ -428,6 +619,14 @@ def main():
                 param['show_cop'] = not param['show_cop']
             if param['hover_dempster']:
                 param['use_dempster'] = not param['use_dempster']
+            if param['hover_auto']:
+                if param['auto_state'] == 'idle':
+                    param['auto_state']    = 'countdown'
+                    param['auto_start_ts'] = time.perf_counter()
+                else:
+                    param['auto_state'] = 'idle'   # cancel
+            if param['hover_world_z']:
+                param['use_world_z'] = not param['use_world_z']
 
     print("Preview running.  Q = quit   R = start/stop recording   C/click Reset = clear")
     cv2.namedWindow("KineCal Live Preview", cv2.WINDOW_NORMAL)
@@ -455,29 +654,86 @@ def main():
                 ml_history_hip.clear()
                 ml_history_dempster.clear()
                 ap_history.clear()
+                ap_world_history.clear()
+                radar_ap_history.clear()
                 metrics_history.clear()
                 trial_start = time.perf_counter()
                 mouse['reset'] = False
 
-            ml_history_hip.append(-cf.hip_ml_px)        # hip midpoint; negate for mirror
-            ml_history_dempster.append(-cf.com_ml_px)    # Dempster CoM; negate for mirror
-            ap_history.append(cf.ap_proxy_px)            # forward = larger trunk = positive AP
+            # ── Auto-trial state machine ──────────────────────────────────────
+            now_t = time.perf_counter()
+            auto_elapsed = now_t - mouse['auto_start_ts']
+            if mouse['auto_state'] == 'countdown':
+                auto_remaining = AUTO_COUNTDOWN_S - auto_elapsed
+                if auto_remaining <= 0:
+                    # Countdown done — start recording
+                    mouse['auto_state']    = 'recording'
+                    mouse['auto_start_ts'] = now_t
+                    recording = True
+                    recorded  = []
+                    print("Auto-trial recording started")
+            elif mouse['auto_state'] == 'recording':
+                auto_remaining = AUTO_RECORD_S - auto_elapsed
+                if auto_remaining <= 0:
+                    # Recording done — save and reset
+                    recording = False
+                    mouse['auto_state'] = 'idle'
+                    print(f"Auto-trial complete — {len(recorded)} frames")
+                    save_recording(recorded, reader.px_per_m, radar_ap_hist=list(radar_ap_history))
+
+            ml_history_hip.append((cf.host_ts, -cf.hip_ml_px))
+            ml_history_dempster.append((cf.host_ts, -cf.com_ml_px))
+            ap_history.append((cf.host_ts, cf.ap_proxy_px))
+            ap_world_history.append((cf.host_ts, cf.ap_world_m))
+
+            # Drain radar queue — radar runs at ~20 Hz, camera at ~43 Hz
+            # Prefer range-profile centroid (subject_range_m, ~5 mm precision) over
+            # point-cloud median (~4 cm CFAR quantisation).
+            if radar_reader:
+                _drained = 0
+                while _drained < 10:
+                    try:
+                        rf = radar_reader.queue.get_nowait()
+                    except Exception:
+                        break
+                    if np.isfinite(rf.subject_range_m):
+                        radar_ap_history.append((rf.host_ts, rf.subject_range_m))
+                    elif rf.points:
+                        # fallback to point-cloud median if range profile unavailable
+                        radar_ap_history.append(
+                            (rf.host_ts, float(np.median([p.y for p in rf.points])))
+                        )
+                    _drained += 1
 
             if recording:
                 recorded.append(cf)
 
+            # AP gain from custom drawn slider
+            ap_gain = mouse['ap_gain']
+
             # ── Camera panel ──────────────────────────────────────────────────
             w, h = cf.image_width, cf.image_height
             canvas = cv2.flip(cf.bgr_frame, 1) if cf.bgr_frame is not None else np.zeros((h, w, 3), dtype=np.uint8)
-            # Mirror skeleton landmarks to match flipped frame
+
+            # Resize to display width (capture may be 1280x720 but we display at 640x360)
+            disp_h = max(1, int(h * DISPLAY_WIDTH / w))
+            scale  = DISPLAY_WIDTH / w
+            if w != DISPLAY_WIDTH:
+                canvas = cv2.resize(canvas, (DISPLAY_WIDTH, disp_h), interpolation=cv2.INTER_LINEAR)
+            w, h = DISPLAY_WIDTH, disp_h   # update w/h to display dimensions
+
+            # Mirror skeleton landmarks and scale to display size
             mirrored_landmarks = None
             if cf.landmarks:
-                mirrored_landmarks = {k: (w - v[0], v[1], v[2], v[3]) for k, v in cf.landmarks.items()}
+                mirrored_landmarks = {
+                    k: ((cf.image_width - v[0]) * scale, v[1] * scale, v[2], v[3])
+                    for k, v in cf.landmarks.items()
+                }
             draw_skeleton(canvas, mirrored_landmarks)
 
-            # Dempster CoM dot — mirrored X to match flipped canvas
+            # Dempster CoM dot — mirrored X, scaled to display
             if np.isfinite(cf.com_ml_px) and np.isfinite(cf.com_y_px):
-                com_px = (int(cf.image_width - cf.com_ml_px), int(cf.com_y_px))
+                com_px = (int((cf.image_width - cf.com_ml_px) * scale), int(cf.com_y_px * scale))
                 cv2.circle(canvas, com_px, 10, (0, 100, 255), -1, cv2.LINE_AA)
                 cv2.circle(canvas, com_px,  10, (255, 255, 255), 1,  cv2.LINE_AA)
 
@@ -491,8 +747,19 @@ def main():
 
             put_text(canvas, pose_str,               (10, 28),      0.7,  pose_col,       2)
             put_text(canvas, cal_str,                (10, 54),      0.5,  (220, 220, 220))
-            put_text(canvas, f"FPS: {fps:.1f}",      (10, 76),      0.5,  (180, 255, 180))
+            dropped = reader.frames_dropped
+            drop_col = (0, 80, 255) if dropped > 0 else (180, 255, 180)
+            put_text(canvas, f"FPS: {fps:.1f}  frames: {cf.frame_number}  drop: {dropped}", (10, 76), 0.5, drop_col)
             put_text(canvas, res_str,                (10, 96),      0.4,  (160, 200, 160))
+            put_text(canvas, f"AP gain: {ap_gain:.1f}x", (10, 114),   0.4,  (200, 180, 120))
+            # AP source indicator
+            _r_active = radar_reader is not None and len(radar_ap_history) > 5
+            if _r_active:
+                put_text(canvas, "AP: Radar", (10, 132), 0.4, (50, 255, 80))
+            elif mouse['use_world_z']:
+                put_text(canvas, "AP: WorldZ", (10, 132), 0.4, (50, 200, 255))
+            else:
+                put_text(canvas, "AP: TrunkL", (10, 132), 0.4, (160, 140, 90))
             put_text(canvas, "Q:quit  R:rec  C:clear", (10, h - 10), 0.42, (200, 200, 200))
             t_cam_col = (100, 255, 100) if trial_elapsed >= 30 else \
                         (0, 210, 255)   if trial_elapsed >= 20 else \
@@ -510,8 +777,21 @@ def main():
             # Filter at 6 Hz before plotting — same practice as force plate
             # displays, removes landmark jitter while preserving sway content.
             ml_src = ml_history_dempster if mouse['use_dempster'] else ml_history_hip
-            ml_arr = np.array(ml_src, dtype=np.float64)
-            ap_arr = np.array(ap_history, dtype=np.float64)
+            ts_arr = np.array([t for t, v in ml_src], dtype=np.float64)
+            ml_arr = np.array([v for t, v in ml_src], dtype=np.float64)
+
+            # AP source priority: Radar > WorldZ toggle > Trunk-length proxy
+            ppm = reader.px_per_m or 300.0
+            _r_active = radar_reader is not None and len(radar_ap_history) > 5
+            if _r_active:
+                # Radar range (metres) interpolated onto camera timestamps, converted to pixels
+                r_ts   = np.array([t for t, v in radar_ap_history], dtype=np.float64)
+                r_vals = np.array([v for t, v in radar_ap_history], dtype=np.float64)
+                ap_arr = np.interp(ts_arr, r_ts, r_vals) * ppm
+            elif mouse['use_world_z']:
+                ap_arr = np.array([v * ppm for t, v in ap_world_history], dtype=np.float64)
+            else:
+                ap_arr = np.array([v for t, v in ap_history], dtype=np.float64)
 
             def _prep(arr, fc=6.0):
                 out = arr.copy()                       # never mutate input
@@ -524,7 +804,7 @@ def main():
                     from scipy.signal import butter, filtfilt
                     # Cap fc at 40% of Nyquist — prevents instability when FPS drops
                     fc_safe = min(fc, max(fps, 5.0) * 0.4)
-                    Wn = min(np.pi * fc_safe / (2 * max(fps, 5.0)), 0.99)
+                    Wn = min(2.0 * fc_safe / max(fps, 5.0), 0.99)
                     b, a = butter(2, Wn, btype='low')
                     out = filtfilt(b, a, out)
                 return out
@@ -534,7 +814,7 @@ def main():
             # AP proxy is noisier than ML (two independent landmark jitters
             # vs averaged midpoint).  Lower cutoff reduces noise without
             # causing loops — filtfilt is zero-phase at any cutoff.
-            ap_in = ap_arr * (_ap_fudge_factor(reader.px_per_m, cf.image_width, SUBJECT_HEIGHT_M)
+            ap_in = ap_arr * ap_gain * (_ap_fudge_factor(reader.px_per_m, cf.image_width, SUBJECT_HEIGHT_M)
                               if (mouse['fudge_ap'] and cf.image_width > 0) else 1.0)
             plot_ap = _prep(ap_in, fc=3.0)
 
@@ -559,7 +839,7 @@ def main():
                 plot_ap = _prep(cop_ap_m * ppm, fc=2.0)
 
             # ── Stabilogram panel ─────────────────────────────────────────────
-            stab, raw_metrics = draw_stabilogram(plot_ml, plot_ap, fps,
+            stab, raw_metrics = draw_stabilogram(plot_ml, plot_ap, ts_arr, fps,
                                                  px_per_m=reader.px_per_m,
                                                  fudge_ap=mouse['fudge_ap'],
                                                  show_cop=mouse['show_cop'],
@@ -581,6 +861,10 @@ def main():
             stab_h = max(1, h - METRICS_H)
             stab_resized = cv2.resize(stab, (STAB_SIZE, stab_h))
 
+            auto_elapsed = time.perf_counter() - mouse['auto_start_ts']
+            auto_cd_remaining = max(0.0, AUTO_COUNTDOWN_S - auto_elapsed)
+            auto_rec_remaining = max(0.0, AUTO_RECORD_S - auto_elapsed)
+
             draw_buttons(stab_resized,
                          hover_reset=mouse['hover_reset'],
                          hover_fudge=mouse['hover_fudge'],
@@ -588,13 +872,64 @@ def main():
                          hover_cop=mouse['hover_cop'],
                          cop_active=mouse['show_cop'],
                          hover_dempster=mouse['hover_dempster'],
-                         dempster_active=mouse['use_dempster'])
+                         dempster_active=mouse['use_dempster'],
+                         hover_auto=mouse['hover_auto'],
+                         auto_state=mouse['auto_state'],
+                         auto_countdown=auto_cd_remaining,
+                         hover_world_z=mouse['hover_world_z'],
+                         world_z_active=mouse['use_world_z'])
+
+            # ── Auto-trial overlay on camera canvas ───────────────────────────
+            if mouse['auto_state'] == 'countdown':
+                cd = int(auto_cd_remaining) + 1
+                txt = f"GET READY: {cd}"
+                col_cd = (0, 220, 255)
+                put_text(canvas, txt,
+                         (w // 2 - 140, h // 2),
+                         2.2, col_cd, 4)
+            elif mouse['auto_state'] == 'recording':
+                rec_done = AUTO_RECORD_S - auto_rec_remaining
+                bar_w    = int((rec_done / AUTO_RECORD_S) * (w - 20))
+                cv2.rectangle(canvas, (10, h - 18), (w - 10, h - 6), (60, 60, 60), -1)
+                cv2.rectangle(canvas, (10, h - 18), (10 + bar_w, h - 6), (0, 60, 220), -1)
+                put_text(canvas, f"REC  {rec_done:.0f} / {AUTO_RECORD_S}s",
+                         (w // 2 - 110, h // 2),
+                         1.6, (60, 60, 255), 3)
 
             # ── Metrics strip below stabilogram ───────────────────────────────
             cal = raw_metrics['calibrated']
             metrics_strip = draw_metrics_strip(
                 avg_ce, avg_path, avg_mvelo, cal, trial_elapsed,
                 STAB_SIZE, METRICS_H)
+
+            # ── AP gain slider drawn in metrics strip ─────────────────────────
+            sl_pad   = 10
+            sl_x1_l  = sl_pad                       # local coords within metrics_strip
+            sl_x2_l  = STAB_SIZE - sl_pad
+            sl_y1_l  = METRICS_H - 30
+            sl_y2_l  = METRICS_H - 14
+            sl_w     = sl_x2_l - sl_x1_l
+            knob_t   = (mouse['ap_gain'] - 0.1) / (20.0 - 0.1)
+            knob_x_l = int(sl_x1_l + knob_t * sl_w)
+            # Track label
+            cv2.putText(metrics_strip, f"AP gain: {mouse['ap_gain']:.1f}x",
+                        (sl_x1_l, sl_y1_l - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (160, 140, 80), 1, cv2.LINE_AA)
+            # Track
+            cv2.rectangle(metrics_strip, (sl_x1_l, sl_y1_l), (sl_x2_l, sl_y2_l),
+                          (60, 60, 60), -1)
+            cv2.rectangle(metrics_strip, (sl_x1_l, sl_y1_l), (knob_x_l, sl_y2_l),
+                          (180, 130, 40), -1)
+            # Knob
+            knob_cy = (sl_y1_l + sl_y2_l) // 2
+            cv2.circle(metrics_strip, (knob_x_l, knob_cy), 7, (255, 200, 80), -1, cv2.LINE_AA)
+            cv2.circle(metrics_strip, (knob_x_l, knob_cy), 7, (255, 255, 200), 1, cv2.LINE_AA)
+
+            # Store slider bounds in combined-image coords for mouse callback
+            mouse['_sl_x1'] = w + sl_x1_l
+            mouse['_sl_x2'] = w + sl_x2_l
+            mouse['_sl_y1'] = stab_h + sl_y1_l - 8   # small hit buffer
+            mouse['_sl_y2'] = stab_h + sl_y2_l + 8
 
             right_panel = np.vstack([stab_resized, metrics_strip])
             combined = np.hstack([canvas, right_panel])
@@ -619,31 +954,12 @@ def main():
                 else:
                     recording = False
                     print(f"Recording stopped — {len(recorded)} frames")
-                    ts  = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    out = f"recording_{ts}.pkl"
-                    with open(out, 'wb') as f:
-                        pickle.dump(recorded, f)
-                    print(f"Saved to {out}")
-                    # CSV export — cm units, mean-centering left to post-processing
-                    csv_out = f"recording_{ts}.csv"
-                    ppm    = reader.px_per_m or 1.0
-                    s2cm   = 100.0 / ppm
-                    t0     = recorded[0].host_ts
-                    with open(csv_out, 'w', newline='') as csvf:
-                        csvf.write("time_s,hip_ml_cm,ap_cm,com_ml_cm,com_y_cm\n")
-                        for rec in recorded:
-                            def _c(v, sign=1):
-                                return sign * v * s2cm if np.isfinite(v) else float('nan')
-                            row = [rec.host_ts - t0,
-                                   _c(rec.hip_ml_px, -1),
-                                   _c(rec.ap_proxy_px),
-                                   _c(rec.com_ml_px, -1),
-                                   _c(rec.com_y_px)]
-                            csvf.write(','.join('nan' if np.isnan(v) else f'{v:.4f}' for v in row) + '\n')
-                    print(f"CSV  saved to {csv_out}")
+                    save_recording(recorded, reader.px_per_m, radar_ap_hist=list(radar_ap_history))
 
     finally:
         reader.stop()
+        if radar_reader:
+            radar_reader.stop()
         cv2.destroyAllWindows()
 
 

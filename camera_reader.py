@@ -173,6 +173,7 @@ CameraFrame = namedtuple('CameraFrame', [
     'hip_height_px',  # float: vertical hip midpoint Y in pixels, or NaN
     'shoulder_ml_px', # float: shoulder midpoint X in pixels
     'ap_proxy_px',    # float: AP sway proxy from apparent body height (px) — larger = closer, or NaN
+    'ap_world_m',     # float: hip midpoint Z from MediaPipe world landmarks (metres) — direct AP estimate, or NaN
     'com_ml_px',      # float: Dempster-weighted whole-body CoM X in pixels, or NaN
     'com_y_px',       # float: Dempster-weighted whole-body CoM Y in pixels (image coords), or NaN
     'image_width',    # int
@@ -246,8 +247,8 @@ class CameraReader:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        # Try Media Foundation first (same API as Windows Camera app — better compatibility
-        # with some drivers e.g. PS3 Universal), then fall back to DirectShow.
+        # MSMF is preferred on Windows — it uses hardware-accelerated decoding
+        # and handles high-res streams (e.g. 1280x720) more efficiently than DSHOW.
         for backend, name in [(cv2.CAP_MSMF, 'MSMF'), (cv2.CAP_DSHOW, 'DSHOW'), (0, 'default')]:
             self._cap = cv2.VideoCapture(self.device_index, backend)
             if self._cap.isOpened():
@@ -258,8 +259,6 @@ class CameraReader:
                 f"Cannot open camera device {self.device_index}. "
                 f"Run the camera index check snippet to find available devices."
             )
-        # Set resolution and FPS — do not force MJPEG codec as some drivers
-        # (e.g. PS3 Universal) use their own internal format and ignore it.
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.capture_width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.capture_height)
         self._cap.set(cv2.CAP_PROP_FPS, self.fps)
@@ -329,13 +328,13 @@ class CameraReader:
                     frame_num += 1
                     h, w = bgr.shape[:2]
 
-                    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                     if self.inference_width > 0 and w > self.inference_width:
                         inf_h = max(1, int(h * self.inference_width / w))
-                        inf_rgb = cv2.resize(rgb, (self.inference_width, inf_h),
+                        inf_bgr = cv2.resize(bgr, (self.inference_width, inf_h),
                                              interpolation=cv2.INTER_LINEAR)
+                        inf_rgb = cv2.cvtColor(inf_bgr, cv2.COLOR_BGR2RGB)
                     else:
-                        inf_rgb = rgb
+                        inf_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
                     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=inf_rgb)
                     timestamp_ms = int(host_ts * 1000)
@@ -347,13 +346,16 @@ class CameraReader:
                             host_ts=host_ts, frame_number=frame_num,
                             landmarks=None, hip_ml_px=float('nan'),
                             hip_height_px=float('nan'), shoulder_ml_px=float('nan'),
-                            ap_proxy_px=float('nan'), com_ml_px=float('nan'),
-                            com_y_px=float('nan'),
+                            ap_proxy_px=float('nan'), ap_world_m=float('nan'),
+                            com_ml_px=float('nan'), com_y_px=float('nan'),
                             image_width=w, image_height=h, bgr_frame=bgr,
                         )
                     else:
+                        world_lm = (result.pose_world_landmarks[0]
+                                    if result.pose_world_landmarks else None)
                         cf = self._build_frame(
-                            result.pose_landmarks[0], host_ts, frame_num, w, h, bgr
+                            result.pose_landmarks[0], world_lm,
+                            host_ts, frame_num, w, h, bgr
                         )
                     self._update_calibration(cf)
                     self._enqueue(cf)
@@ -362,7 +364,7 @@ class CameraReader:
             self._thread_error = exc
             logger.error("CameraReader thread crashed:\n%s", traceback.format_exc())
 
-    def _build_frame(self, lm, host_ts, frame_num, w, h, bgr) -> CameraFrame:
+    def _build_frame(self, lm, world_lm, host_ts, frame_num, w, h, bgr) -> CameraFrame:
         def px(idx):
             l = lm[idx]
             return l.x * w, l.y * h, l.z, getattr(l, 'visibility', 1.0)
@@ -415,6 +417,19 @@ class CameraReader:
 
         com_ml_px, com_y_px = _dempster_com(landmarks)
 
+        # ── World landmark Z — MediaPipe 3-D depth estimate ───────────────────
+        # pose_world_landmarks are in metres with the pelvis as origin.
+        # Z axis points away from camera (positive = forward lean).
+        # Hip midpoint Z is used as a direct AP sway estimate.
+        ap_world_m = float('nan')
+        if world_lm is not None:
+            try:
+                lh_z = world_lm[LEFT_HIP].z
+                rh_z = world_lm[RIGHT_HIP].z
+                ap_world_m = (lh_z + rh_z) / 2.0
+            except Exception:
+                pass
+
         return CameraFrame(
             host_ts=host_ts, frame_number=frame_num,
             landmarks=landmarks,
@@ -422,6 +437,7 @@ class CameraReader:
             hip_height_px=hip_vert_px,
             shoulder_ml_px=shoulder_ml_px,
             ap_proxy_px=ap_proxy_px,
+            ap_world_m=ap_world_m,
             com_ml_px=com_ml_px,
             com_y_px=com_y_px,
             image_width=w, image_height=h, bgr_frame=bgr,
