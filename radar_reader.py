@@ -172,15 +172,46 @@ class RadarReader:
 
     # ── Configuration ─────────────────────────────────────────────────────────
 
+    def _wait_for_prompt(self, prompt: str = 'mmwDemo:/>', timeout: float = 3.0) -> str:
+        """
+        Read from the config UART until the CLI prompt appears or timeout expires.
+
+        Using a fixed time.sleep() + read_all() races against firmware processing
+        time — if 'Done' arrives after the window, the next command is sent before
+        the firmware is ready, leaving the configuration incomplete and causing
+        sensorStart to fail with 'Full configuration must be provided'.
+        """
+        resp = ''
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            n = self._ser_cfg.in_waiting
+            if n:
+                resp += self._ser_cfg.read(n).decode(errors='ignore')
+                if prompt in resp:
+                    break
+            else:
+                time.sleep(0.005)   # 5 ms poll — fast enough to catch all responses
+        return resp
+
     def _configure(self) -> None:
-        self._ser_cfg = serial.Serial(self.config_port, self.config_baud, timeout=1)
-        time.sleep(0.5)
+        """Open the config UART, send all chirp-config commands, then open the data port."""
+        self._ser_cfg = serial.Serial(self.config_port, self.config_baud, timeout=2)
+        time.sleep(0.3)
+        self._ser_cfg.reset_input_buffer()   # discard stale bytes from any prior session
+
+        failed = []
         for cmd in self.config_commands:
             self._ser_cfg.write((cmd + '\n').encode())
-            time.sleep(0.05)
-            response = self._ser_cfg.read_all().decode(errors='ignore')
-            if 'Error' in response:
-                logger.warning("Config command '%s' returned: %s", cmd, response.strip())
+            resp = self._wait_for_prompt(timeout=3.0)
+            if 'Error' in resp:
+                logger.warning("Config command '%s' returned: %s", cmd, resp.strip())
+                failed.append(cmd)
+
+        if failed:
+            print(f"[Radar] WARNING: {len(failed)} command(s) returned errors: {failed}")
+        else:
+            print(f"[Radar] All {len(self.config_commands)} config commands accepted OK")
+
         self._ser_data = serial.Serial(self.data_port, self.data_baud, timeout=1)
         logger.info("IWR6843 configured and sensor started")
 
