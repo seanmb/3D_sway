@@ -220,18 +220,44 @@ class RadarReader:
 
     def _configure(self) -> None:
         """Open the config UART, send all chirp-config commands, then open the data port."""
-        self._ser_cfg = serial.Serial(self.config_port, self.config_baud, timeout=2)
-        time.sleep(0.3)
-        self._ser_cfg.reset_input_buffer()   # discard stale bytes from any prior session
+        # dsrdtr=False / rtscts=False: prevent pyserial from toggling DTR/RTS on open,
+        # which can trigger a hardware reset of the XDS110 and force a 2-3 s boot wait.
+        self._ser_cfg = serial.Serial(
+            self.config_port, self.config_baud, timeout=2,
+            dsrdtr=False, rtscts=False)
+        time.sleep(0.5)
+        self._ser_cfg.reset_input_buffer()
+
+        # ── Wait for CLI prompt ───────────────────────────────────────────────
+        # The firmware CLI may be:
+        #   a) already at the prompt (sensor running from a previous session)
+        #   b) booting (XDS110 reset on port open) — needs ~2 s before prompt appears
+        # Send blank newlines until we see 'mmwDemo:/>' or give up after ~5 s.
+        print(f"[Radar] Waiting for CLI prompt on {self.config_port} ...")
+        got_prompt = False
+        for _attempt in range(15):
+            self._ser_cfg.write(b'\n')
+            wake = self._wait_for_prompt(timeout=0.4)
+            if 'mmwDemo:/>' in wake:
+                got_prompt = True
+                break
+            time.sleep(0.25)
+
+        if got_prompt:
+            print("[Radar] CLI ready.")
+        else:
+            print("[Radar] WARNING: CLI prompt not seen after 5 s — "
+                  "proceeding anyway (commands may T/O).")
+        self._ser_cfg.reset_input_buffer()
 
         n_cmds = len(self.config_commands)
-        print(f"[Radar] Sending {n_cmds} config commands to {self.config_port} ...")
+        print(f"[Radar] Sending {n_cmds} config commands ...")
         failed = []
         for i, cmd in enumerate(self.config_commands, 1):
             self._ser_cfg.write((cmd + '\n').encode())
             resp = self._wait_for_prompt(timeout=3.0)
 
-            # Classify response so we can spot timing / missing-command issues
+            # Classify response
             if 'Done' in resp:
                 status = 'OK '
             elif 'Error' in resp:
@@ -239,20 +265,17 @@ class RadarReader:
                 logger.warning("Config command '%s' returned: %s", cmd, resp.strip())
                 failed.append(cmd)
             else:
-                status = 'T/O'  # timed out — firmware never sent 'Done' or 'Error'
+                status = 'T/O'
 
             name = cmd.split()[0]
             print(f"  {i:2d}/{n_cmds}  {name:<40s} {status}")
             if status != 'OK ':
-                # Print the raw response to help diagnose the issue
                 print(f"         response: {repr(resp.strip()[:200])}")
 
         if failed:
             print(f"[Radar] WARNING: {len(failed)} command(s) returned errors: {failed}")
-        elif any('T/O' in str(s) for s in []):   # placeholder — T/O counted above
-            pass
         else:
-            print(f"[Radar] All {n_cmds} config commands accepted (see OK/ERR/T/O above)")
+            print(f"[Radar] All {n_cmds} config commands accepted.")
 
         self._ser_data = serial.Serial(self.data_port, self.data_baud, timeout=1)
         logger.info("IWR6843 configured and sensor started")
