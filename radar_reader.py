@@ -100,7 +100,9 @@ DEFAULT_CONFIG = [
     "cfarCfg -1 0 2 8 4 3 0 15 1",
     "cfarCfg -1 1 0 4 2 3 1 15 1",
     "multiObjBeamForming -1 1 0.5",
-    "clutterRemoval -1 1",         # enable static clutter removal — removes standing-still bias
+    "clutterRemoval -1 0",         # DISABLED — clutter-removal converges on the stationary subject
+                                    # and subtracts them from the range profile, making _centroid_range()
+                                    # return NaN.  Mean-centering in the stabilogram handles the DC offset.
     "calibDcRangeSig -1 0 -5 8 256",
     "extendedMaxVelocity -1 0",
     "lvdsStreamCfg -1 0 0 0",

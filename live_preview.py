@@ -34,7 +34,7 @@ from sensor_fusion import estimate_cop
 logging.basicConfig(level=logging.WARNING)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DEVICE_INDEX      = 1
+DEVICE_INDEX      = 0
 SUBJECT_HEIGHT_M  = 1.70
 HISTORY_S         = 5          # seconds of sway to show in stabilogram
 STAB_SIZE         = 320         # stabilogram panel: square pixels
@@ -752,15 +752,19 @@ def main():
             put_text(canvas, f"FPS: {fps:.1f}  frames: {cf.frame_number}  drop: {dropped}", (10, 76), 0.5, drop_col)
             put_text(canvas, res_str,                (10, 96),      0.4,  (160, 200, 160))
             put_text(canvas, f"AP gain: {ap_gain:.1f}x", (10, 114),   0.4,  (200, 180, 120))
-            # AP source indicator
+            # AP source indicator — includes radar frame counter for diagnostics
             _r_active = radar_reader is not None and len(radar_ap_history) > 5
             _r_cfg    = bool(RADAR_CONFIG_PORT and RADAR_DATA_PORT)
+            _r_frames = radar_reader.frames_received if radar_reader else 0
             if _r_active:
-                put_text(canvas, "AP: Radar", (10, 132), 0.4, (50, 255, 80))
+                put_text(canvas, f"AP: Radar ({_r_frames}f)", (10, 132), 0.4, (50, 255, 80))
             elif _r_cfg and radar_reader is None:
-                put_text(canvas, "AP: Radar FAIL", (10, 132), 0.4, (60, 60, 255))  # red — port error
-            elif _r_cfg and len(radar_ap_history) == 0:
-                put_text(canvas, "AP: Radar wait", (10, 132), 0.4, (60, 200, 255))  # waiting for data
+                put_text(canvas, "AP: Radar FAIL", (10, 132), 0.4, (60, 60, 255))
+            elif _r_cfg and _r_frames == 0:
+                put_text(canvas, "AP: Radar wait 0f", (10, 132), 0.4, (60, 200, 255))
+            elif _r_cfg:
+                # frames arriving but NaN range + empty points — detection issue
+                put_text(canvas, f"AP: Radar {_r_frames}f nodet", (10, 132), 0.4, (0, 170, 255))
             elif mouse['use_world_z']:
                 put_text(canvas, "AP: WorldZ", (10, 132), 0.4, (50, 200, 255))
             else:
