@@ -378,21 +378,38 @@ class RadarReader:
         # ── Detect person, then refine ───────────────────────────────────────
         # Step 1: cluster CFAR point cloud → identify which range the person
         #         occupies (angle + Doppler discrimination — rejects static objects).
-        # Step 2: narrow the range-profile centroid to ±0.30 m around that cluster
-        #         → ~5 mm precision without tracking furniture.
-        # Fallback: if no CFAR cluster found, use the full-window range-profile
-        #           centroid (brightest reflector in [RANGE_MIN_M, RANGE_MAX_M]).
+        # Step 2: narrow the range-profile centroid to ±0.40 m around that range
+        #         → ~5 mm precision locked to the person, not the brightest object.
+        #
+        # Critical fallback priority (avoids latching onto furniture/walls):
+        #   a. Cluster found this frame          → gate centroid on cluster y
+        #   b. No cluster but tracker is fresh   → gate centroid on last known y
+        #   c. No cluster AND tracker is stale   → full-window centroid (last resort)
+        #
+        # NEVER fall straight from "no cluster" to full-window centroid — that
+        # makes the signal jump between the person (~1.5 m) and a distant wall
+        # on every frame that produces a sparse CFAR cloud.
         person_coarse = (self._find_person_cluster(points, host_ts)
                          if points else float('nan'))
 
+        # Choose gate centre: cluster > fresh tracker > none
+        _tracker_fresh = (np.isfinite(self._person_y) and
+                          (host_ts - self._person_ts) < 2.0)
+        if np.isfinite(person_coarse):
+            gate_m = person_coarse
+        elif _tracker_fresh:
+            gate_m = self._person_y   # hold the last confirmed position
+        else:
+            gate_m = float('nan')
+
         if range_profile is not None:
-            if np.isfinite(person_coarse):
+            if np.isfinite(gate_m):
                 subject_range_m = self._centroid_range(
-                    range_profile, center_m=person_coarse, search_r=0.30)
+                    range_profile, center_m=gate_m, search_r=0.40)
             else:
                 subject_range_m = self._centroid_range(range_profile)
-        elif np.isfinite(person_coarse):
-            subject_range_m = person_coarse   # no range profile — use cluster centroid
+        elif np.isfinite(gate_m):
+            subject_range_m = gate_m
         else:
             subject_range_m = float('nan')
 
@@ -500,8 +517,8 @@ class RadarReader:
     @staticmethod
     def _cluster_points(
         points: list,
-        eps: float = 0.35,
-        min_samples: int = 2,
+        eps: float = 0.45,
+        min_samples: int = 1,
     ) -> list:
         """
         DBSCAN clustering on CFAR point cloud in the (x, y) plane.
@@ -510,8 +527,17 @@ class RadarReader:
         Noise points (DBSCAN label -1) are discarded.
 
         Uses scipy.spatial.cKDTree — no sklearn dependency.
-        eps controls the neighbourhood radius in metres (~0.35 m comfortably
-        groups reflections from a single person while separating objects ≥0.5 m apart).
+
+        Parameters
+        ----------
+        eps : float
+            Neighbourhood radius in metres.  0.45 m groups a person's body
+            reflections (~4 TX beams wide) while keeping objects >0.5 m apart
+            in separate clusters.
+        min_samples : int
+            Minimum points to form a cluster.  1 = every point is a cluster
+            (no noise rejection) which is necessary for sparse 16-loop CFAR
+            clouds that often produce only 1–3 points per frame.
         """
         n = len(points)
         if n < min_samples:
@@ -558,7 +584,7 @@ class RadarReader:
         host_ts: float,
         doppler_min: float = 0.04,      # m/s — minimum mean |doppler| to count as "moving"
         tracker_age_max: float = 2.0,   # s   — forget tracker after this long without detection
-        ema_alpha: float = 0.25,        # EMA weight applied to each new measurement
+        ema_alpha: float = 0.15,        # EMA weight per frame — lower = smoother, less jitter
     ) -> float:
         """
         Identify the person in the CFAR point cloud using clustering + Doppler gating.
