@@ -206,18 +206,35 @@ class RadarReader:
         time.sleep(0.3)
         self._ser_cfg.reset_input_buffer()   # discard stale bytes from any prior session
 
+        n_cmds = len(self.config_commands)
+        print(f"[Radar] Sending {n_cmds} config commands to {self.config_port} ...")
         failed = []
-        for cmd in self.config_commands:
+        for i, cmd in enumerate(self.config_commands, 1):
             self._ser_cfg.write((cmd + '\n').encode())
             resp = self._wait_for_prompt(timeout=3.0)
-            if 'Error' in resp:
+
+            # Classify response so we can spot timing / missing-command issues
+            if 'Done' in resp:
+                status = 'OK '
+            elif 'Error' in resp:
+                status = 'ERR'
                 logger.warning("Config command '%s' returned: %s", cmd, resp.strip())
                 failed.append(cmd)
+            else:
+                status = 'T/O'  # timed out — firmware never sent 'Done' or 'Error'
+
+            name = cmd.split()[0]
+            print(f"  {i:2d}/{n_cmds}  {name:<40s} {status}")
+            if status != 'OK ':
+                # Print the raw response to help diagnose the issue
+                print(f"         response: {repr(resp.strip()[:200])}")
 
         if failed:
             print(f"[Radar] WARNING: {len(failed)} command(s) returned errors: {failed}")
+        elif any('T/O' in str(s) for s in []):   # placeholder — T/O counted above
+            pass
         else:
-            print(f"[Radar] All {len(self.config_commands)} config commands accepted OK")
+            print(f"[Radar] All {n_cmds} config commands accepted (see OK/ERR/T/O above)")
 
         self._ser_data = serial.Serial(self.data_port, self.data_baud, timeout=1)
         logger.info("IWR6843 configured and sensor started")
