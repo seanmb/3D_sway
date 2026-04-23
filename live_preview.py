@@ -327,6 +327,120 @@ def draw_metrics_strip(ce, path_len, mvelo, calibrated, trial_elapsed, width, he
     return panel
 
 
+def draw_radar_trace(radar_ap_history, panel_w, panel_h, history_s=HISTORY_S):
+    """
+    1-D radar AP waveform: scrolling time-series of mean-centred range (cm).
+
+    Radar gives absolute range in metres.  We mean-centre each display window
+    so small postural sway (±2–5 cm) fills the panel regardless of stand-off
+    distance.  Y scale auto-fits to 2.5× the signal std (min ±2 cm).
+
+    Returns (panel BGR, metrics_dict) where metrics contain:
+      ap_rms   — RMS of mean-centred AP signal (cm)
+      ap_range — peak-to-peak range (cm)
+      mvelo    — mean velocity of AP signal (cm/s)
+    """
+    panel = np.full((panel_h, panel_w, 3), 20, dtype=np.uint8)
+    mg_l, mg_r = 40, 8
+    mg_t, mg_b = 20, 22
+    plot_w = panel_w - mg_l - mg_r
+    plot_h = panel_h - mg_t - mg_b
+
+    empty_metrics = {'ap_rms': None, 'ap_range': None, 'mvelo': None}
+
+    if len(radar_ap_history) < 2:
+        cv2.putText(panel, "Radar AP: waiting...", (mg_l, panel_h // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (120, 120, 120), 1)
+        return panel, empty_metrics
+
+    # Clip to last history_s seconds
+    t_end  = radar_ap_history[-1][0]
+    recent = [(t, v) for t, v in radar_ap_history if t >= t_end - history_s]
+    if len(recent) < 2:
+        recent = list(radar_ap_history)
+
+    ts_raw = np.array([t for t, v in recent], dtype=np.float64)
+    vals   = np.array([v for t, v in recent], dtype=np.float64) * 100.0  # m → cm
+    vals  -= np.nanmean(vals)                                             # mean-centre
+
+    # Y-axis half-range: 2.5× std, at least ±2 cm
+    y_half = max(2.0, float(np.nanstd(vals)) * 2.5)
+
+    # Normalised time: 0 = oldest shown, 1 = now
+    t_norm = (ts_raw - (t_end - history_s)) / max(history_s, 1e-6)
+
+    def to_px(t_n, v_cm):
+        x = int(mg_l + np.clip(t_n, 0.0, 1.0) * plot_w)
+        y = int(mg_t + plot_h // 2 - (v_cm / y_half) * (plot_h / 2))
+        return (np.clip(x, mg_l, mg_l + plot_w),
+                np.clip(y, mg_t, mg_t + plot_h))
+
+    # Grid lines
+    cy = mg_t + plot_h // 2
+    cv2.line(panel, (mg_l, cy), (mg_l + plot_w, cy), (55, 55, 55), 1)
+    for tick in [y_half * 0.5]:                       # mid-scale tick
+        for sign in (-1, 1):
+            ty = int(mg_t + plot_h / 2 - sign * tick / y_half * (plot_h / 2))
+            cv2.line(panel, (mg_l, ty), (mg_l + plot_w, ty), (38, 38, 38), 1)
+    for t_s in range(1, int(history_s) + 1):          # vertical time ticks
+        tx = int(mg_l + (t_s / history_s) * plot_w)
+        cv2.line(panel, (tx, mg_t + plot_h), (tx, mg_t + plot_h + 4), (55, 55, 55), 1)
+
+    # Waveform (blue-old → green-new gradient)
+    n = len(vals)
+    for i in range(1, n):
+        if np.isnan(vals[i - 1]) or np.isnan(vals[i]):
+            continue
+        t_frac = i / max(n - 1, 1)
+        colour = (int(40 + 140 * t_frac), int(200 * t_frac), int(220 * (1 - t_frac)))
+        cv2.line(panel, to_px(t_norm[i - 1], vals[i - 1]),
+                 to_px(t_norm[i], vals[i]), colour, 2, cv2.LINE_AA)
+
+    # Current position dot
+    if np.isfinite(vals[-1]):
+        cv2.circle(panel, to_px(t_norm[-1], vals[-1]), 5, (0, 255, 255), -1, cv2.LINE_AA)
+
+    # Axis labels
+    put_text(panel, "Radar AP",      (mg_l + 2, mg_t - 4),         0.38, (200, 200, 200))
+    put_text(panel, "cm",            (4, cy + 4),                   0.30, (110, 110, 110))
+    put_text(panel, f"+{y_half:.1f}", (4, mg_t + 8),                0.28, (90,  90,  90))
+    put_text(panel, f"-{y_half:.1f}", (4, mg_t + plot_h - 2),       0.28, (90,  90,  90))
+    put_text(panel, f"{history_s:.0f}s",
+             (mg_l + plot_w - 14, mg_t + plot_h + mg_b - 4),        0.28, (90,  90,  90))
+
+    # Metrics
+    duration = float(ts_raw[-1] - ts_raw[0]) if len(ts_raw) > 1 else 1.0
+    ap_rms   = float(np.nanstd(vals))
+    ap_range = float(np.nanmax(vals) - np.nanmin(vals))
+    mvelo    = float(np.sum(np.abs(np.diff(vals)))) / max(duration, 1e-3)
+    return panel, {'ap_rms': ap_rms, 'ap_range': ap_range, 'mvelo': mvelo}
+
+
+def draw_metrics_strip_radar(ap_rms, ap_range, mvelo, trial_elapsed, width, height):
+    """Metrics strip for the 1-D radar trace panel (RMS, Range, MVELO — all in cm)."""
+    panel = np.full((height, width, 3), 12, dtype=np.uint8)
+    cv2.line(panel, (0, 0), (width, 0), (60, 60, 60), 2)
+
+    entries = [
+        ("RMS",   f"{ap_rms:.2f} cm"   if ap_rms   is not None else "--", (0,   200, 255)),
+        ("Range", f"{ap_range:.2f} cm" if ap_range is not None else "--", (100, 255, 120)),
+        ("MVELO", f"{mvelo:.2f} cm/s"  if mvelo    is not None else "--", (255, 215,  50)),
+    ]
+    row_h = (height - 20) // len(entries)
+    for i, (label, value, color) in enumerate(entries):
+        y_label = 18 + i * row_h
+        y_value = y_label + row_h - 12
+        put_text(panel, label, (10, y_label), 0.55, (150, 150, 150))
+        put_text(panel, value, (10, y_value), 1.40, color, 3)
+
+    t_color = (100, 255, 100) if trial_elapsed >= 30 else \
+              (255, 220,  50) if trial_elapsed >= 20 else \
+              (180, 180, 180)
+    t_str = f"T:{trial_elapsed:.0f}s" + (" DONE" if trial_elapsed >= 30 else "")
+    put_text(panel, t_str, (width - 140, height - 10), 0.65, t_color, 2)
+    return panel
+
+
 # Button bounds in the resized stabilogram panel (STAB_SIZE wide, h tall)
 BTN_X1,  BTN_Y1  = STAB_SIZE - 80, 8
 BTN_X2,  BTN_Y2  = STAB_SIZE - 4,  36
@@ -425,14 +539,14 @@ def draw_buttons(panel, hover_reset=False, hover_fudge=False, fudge_active=False
     cv2.rectangle(panel, (BTN6_X1, BTN6_Y1), (BTN6_X2, BTN6_Y2), (80, 180, 200), 1)
     cv2.putText(panel, label6, (BTN6_X1 + 6, BTN6_Y2 - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, lcol6, 1, cv2.LINE_AA)
-    # Solo / Cam toggle — hides camera feed, enlarges stabilogram
+    # Trace / 2D toggle — switches right panel between 1-D radar AP waveform and 2-D stabilogram
     if solo_mode:
-        col7, label7, lcol7 = (160, 80, 0) if not hover_solo else (210, 110, 0), "Cam", (255, 200, 120)
+        col7, label7, lcol7 = (0, 110, 60) if not hover_solo else (0, 150, 80), "2D", (150, 255, 180)
     else:
-        col7, label7, lcol7 = (40, 40, 100) if not hover_solo else (60, 60, 140), "Solo", (180, 180, 255)
+        col7, label7, lcol7 = (60, 40, 100) if not hover_solo else (90, 60, 140), "Trace", (200, 170, 255)
     cv2.rectangle(panel, (BTN7_X1, BTN7_Y1), (BTN7_X2, BTN7_Y2), col7, -1)
-    cv2.rectangle(panel, (BTN7_X1, BTN7_Y1), (BTN7_X2, BTN7_Y2), (160, 160, 255), 1)
-    cv2.putText(panel, label7, (BTN7_X1 + 10, BTN7_Y2 - 8),
+    cv2.rectangle(panel, (BTN7_X1, BTN7_Y1), (BTN7_X2, BTN7_Y2), (160, 130, 255), 1)
+    cv2.putText(panel, label7, (BTN7_X1 + 6, BTN7_Y2 - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, lcol7, 1, cv2.LINE_AA)
 
 
@@ -959,42 +1073,35 @@ def main():
             mouse['_sl_y1'] = stab_h + sl_y1_l - 8   # small hit buffer
             mouse['_sl_y2'] = stab_h + sl_y2_l + 8
 
-            right_panel = np.vstack([stab_resized, metrics_strip])
-
             if mouse['solo_mode']:
-                # ── Solo mode: large stabilogram fills the left panel ─────────
-                # Scale the stab as a square centred in the camera-sized canvas.
-                sq = min(w, h)                        # largest square that fits
-                stab_big = cv2.resize(stab, (sq, sq), interpolation=cv2.INTER_LINEAR)
-
-                # Overlay key metrics as text on the large stab
-                cal = raw_metrics['calibrated']
-                unit_sq = "cm2" if cal else "px2"
-                unit_l  = "cm"  if cal else "px"
-                _r_frames = radar_reader.frames_received if radar_reader else 0
-                put_text(stab_big, f"Radar  {_r_frames}f  |  T:{trial_elapsed:.0f}s",
-                         (10, 20), 0.55, (50, 255, 80))
-                if avg_ce is not None:
-                    put_text(stab_big, f"CE  {avg_ce:.2f} {unit_sq}",
-                             (10, sq - 62), 0.9, (0, 200, 255), 2)
-                if avg_path is not None:
-                    put_text(stab_big, f"Path  {avg_path:.2f} {unit_l}",
-                             (10, sq - 36), 0.9, (100, 255, 120), 2)
-                if avg_mvelo is not None:
-                    put_text(stab_big, f"MVELO  {avg_mvelo:.2f} {unit_l}/s",
-                             (10, sq - 10), 0.9, (255, 215, 50), 2)
-                if recording:
-                    put_text(stab_big, f"[ REC  {len(recorded)}f ]",
-                             (sq - 160, 22), 0.7, (60, 60, 255), 2)
-
-                # Centre stab_big horizontally in the canvas-width panel
-                solo_left = np.full((h, w, 3), 12, dtype=np.uint8)
-                x_off = (w - sq) // 2
-                y_off = (h - sq) // 2
-                solo_left[y_off:y_off + sq, x_off:x_off + sq] = stab_big
-                combined = np.hstack([solo_left, right_panel])
+                # ── Radar Trace mode: camera on left, 1-D radar AP waveform on right ──
+                # No camera-derived measurements feed this panel — radar range only.
+                trace_panel, trace_metrics = draw_radar_trace(
+                    radar_ap_history, STAB_SIZE, stab_h)
+                trace_metrics_strip = draw_metrics_strip_radar(
+                    trace_metrics['ap_rms'], trace_metrics['ap_range'],
+                    trace_metrics['mvelo'], trial_elapsed, STAB_SIZE, METRICS_H)
+                # Draw all buttons on the trace panel (same states as the stab panel)
+                draw_buttons(trace_panel,
+                             hover_reset=mouse['hover_reset'],
+                             hover_fudge=mouse['hover_fudge'],
+                             fudge_active=mouse['fudge_ap'],
+                             hover_cop=mouse['hover_cop'],
+                             cop_active=mouse['show_cop'],
+                             hover_dempster=mouse['hover_dempster'],
+                             dempster_active=mouse['use_dempster'],
+                             hover_auto=mouse['hover_auto'],
+                             auto_state=mouse['auto_state'],
+                             auto_countdown=auto_cd_remaining,
+                             hover_world_z=mouse['hover_world_z'],
+                             world_z_active=mouse['use_world_z'],
+                             hover_solo=mouse['hover_solo'],
+                             solo_mode=mouse['solo_mode'])
+                right_panel = np.vstack([trace_panel, trace_metrics_strip])
             else:
-                combined = np.hstack([canvas, right_panel])
+                right_panel = np.vstack([stab_resized, metrics_strip])
+
+            combined = np.hstack([canvas, right_panel])
 
             # Keep mouse callback aware of layout dimensions
             mouse['canvas_w'] = w
