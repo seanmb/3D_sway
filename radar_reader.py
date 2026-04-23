@@ -105,10 +105,15 @@ DEFAULT_CONFIG = [
                                     # return NaN.  Mean-centering in the stabilogram handles the DC offset.
     "calibDcRangeSig -1 0 -5 8 256",
     "extendedMaxVelocity -1 0",
+    "bpmCfg -1 0 0 0",               # REQUIRED by SDK 3.x — BPM disabled; omitting this causes
+                                      # Cfg_IsAllCfgReceived() to return false → sensorStart error
     "lvdsStreamCfg -1 0 0 0",
     "compRangeBiasAndRxChanPhase 0.0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0",
     "measureRangeBiasAndRxChanPhase 0 1.5 0.2",
     "nearFieldCfg -1 0 0 0",
+    "CQRxSatMonitor 0 3 5 121 0",    # chirp quality — RX saturation monitor (SDK 3.5)
+    "CQSigImgMonitor 0 127 4",       # chirp quality — signal/image band monitor (SDK 3.5)
+    "analogMonitor 0 0",             # RX saturation + signal image monitoring disabled
     "sensorStart",
 ]
 
