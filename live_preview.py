@@ -340,6 +340,8 @@ BTN5_X1, BTN5_Y1 = STAB_SIZE - 80, 144
 BTN5_X2, BTN5_Y2 = STAB_SIZE - 4,  172
 BTN6_X1, BTN6_Y1 = STAB_SIZE - 80, 178
 BTN6_X2, BTN6_Y2 = STAB_SIZE - 4,  206
+BTN7_X1, BTN7_Y1 = STAB_SIZE - 80, 212
+BTN7_X2, BTN7_Y2 = STAB_SIZE - 4,  240
 
 
 def _ap_fudge_factor(px_per_m, image_width, subject_height_m):
@@ -361,8 +363,9 @@ def draw_buttons(panel, hover_reset=False, hover_fudge=False, fudge_active=False
                   hover_cop=False, cop_active=False,
                   hover_dempster=False, dempster_active=False,
                   hover_auto=False, auto_state='idle', auto_countdown=0.0,
-                  hover_world_z=False, world_z_active=False):
-    """Draw Reset, AP-fudge, and CoM/CoP toggle buttons."""
+                  hover_world_z=False, world_z_active=False,
+                  hover_solo=False, solo_mode=False):
+    """Draw Reset, AP-fudge, CoM/CoP toggle, and Solo-view buttons."""
     # Reset
     col = (100, 100, 200) if hover_reset else (70, 70, 140)
     cv2.rectangle(panel, (BTN_X1, BTN_Y1), (BTN_X2, BTN_Y2), col, -1)
@@ -422,6 +425,15 @@ def draw_buttons(panel, hover_reset=False, hover_fudge=False, fudge_active=False
     cv2.rectangle(panel, (BTN6_X1, BTN6_Y1), (BTN6_X2, BTN6_Y2), (80, 180, 200), 1)
     cv2.putText(panel, label6, (BTN6_X1 + 6, BTN6_Y2 - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, lcol6, 1, cv2.LINE_AA)
+    # Solo / Cam toggle — hides camera feed, enlarges stabilogram
+    if solo_mode:
+        col7, label7, lcol7 = (160, 80, 0) if not hover_solo else (210, 110, 0), "Cam", (255, 200, 120)
+    else:
+        col7, label7, lcol7 = (40, 40, 100) if not hover_solo else (60, 60, 140), "Solo", (180, 180, 255)
+    cv2.rectangle(panel, (BTN7_X1, BTN7_Y1), (BTN7_X2, BTN7_Y2), col7, -1)
+    cv2.rectangle(panel, (BTN7_X1, BTN7_Y1), (BTN7_X2, BTN7_Y2), (160, 160, 255), 1)
+    cv2.putText(panel, label7, (BTN7_X1 + 10, BTN7_Y2 - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, lcol7, 1, cv2.LINE_AA)
 
 
 # ── Landmark order for CSV export ────────────────────────────────────────────
@@ -585,6 +597,8 @@ def main():
         'auto_start_ts': 0.0,
         'hover_world_z': False,
         'use_world_z': False,        # False = trunk-length proxy, True = MediaPipe world Z
+        'hover_solo': False,
+        'solo_mode': False,          # True = hide camera, show large stabilogram on left
         # slider bounds updated each frame
         '_sl_x1': 0, '_sl_x2': 1, '_sl_y1': 0, '_sl_y2': 1,
     }
@@ -597,6 +611,7 @@ def main():
         param['hover_dempster'] = (BTN4_X1 <= sx <= BTN4_X2 and BTN4_Y1 <= y <= BTN4_Y2)
         param['hover_auto']     = (BTN5_X1 <= sx <= BTN5_X2 and BTN5_Y1 <= y <= BTN5_Y2)
         param['hover_world_z']  = (BTN6_X1 <= sx <= BTN6_X2 and BTN6_Y1 <= y <= BTN6_Y2)
+        param['hover_solo']     = (BTN7_X1 <= sx <= BTN7_X2 and BTN7_Y1 <= y <= BTN7_Y2)
 
         # AP gain slider (drawn in metrics strip)
         sl_x1, sl_x2 = param['_sl_x1'], param['_sl_x2']
@@ -627,6 +642,8 @@ def main():
                     param['auto_state'] = 'idle'   # cancel
             if param['hover_world_z']:
                 param['use_world_z'] = not param['use_world_z']
+            if param['hover_solo']:
+                param['solo_mode'] = not param['solo_mode']
 
     print("Preview running.  Q = quit   R = start/stop recording   C/click Reset = clear")
     cv2.namedWindow("KineCal Live Preview", cv2.WINDOW_NORMAL)
@@ -886,7 +903,9 @@ def main():
                          auto_state=mouse['auto_state'],
                          auto_countdown=auto_cd_remaining,
                          hover_world_z=mouse['hover_world_z'],
-                         world_z_active=mouse['use_world_z'])
+                         world_z_active=mouse['use_world_z'],
+                         hover_solo=mouse['hover_solo'],
+                         solo_mode=mouse['solo_mode'])
 
             # ── Auto-trial overlay on camera canvas ───────────────────────────
             if mouse['auto_state'] == 'countdown':
@@ -941,7 +960,41 @@ def main():
             mouse['_sl_y2'] = stab_h + sl_y2_l + 8
 
             right_panel = np.vstack([stab_resized, metrics_strip])
-            combined = np.hstack([canvas, right_panel])
+
+            if mouse['solo_mode']:
+                # ── Solo mode: large stabilogram fills the left panel ─────────
+                # Scale the stab as a square centred in the camera-sized canvas.
+                sq = min(w, h)                        # largest square that fits
+                stab_big = cv2.resize(stab, (sq, sq), interpolation=cv2.INTER_LINEAR)
+
+                # Overlay key metrics as text on the large stab
+                cal = raw_metrics['calibrated']
+                unit_sq = "cm2" if cal else "px2"
+                unit_l  = "cm"  if cal else "px"
+                _r_frames = radar_reader.frames_received if radar_reader else 0
+                put_text(stab_big, f"Radar  {_r_frames}f  |  T:{trial_elapsed:.0f}s",
+                         (10, 20), 0.55, (50, 255, 80))
+                if avg_ce is not None:
+                    put_text(stab_big, f"CE  {avg_ce:.2f} {unit_sq}",
+                             (10, sq - 62), 0.9, (0, 200, 255), 2)
+                if avg_path is not None:
+                    put_text(stab_big, f"Path  {avg_path:.2f} {unit_l}",
+                             (10, sq - 36), 0.9, (100, 255, 120), 2)
+                if avg_mvelo is not None:
+                    put_text(stab_big, f"MVELO  {avg_mvelo:.2f} {unit_l}/s",
+                             (10, sq - 10), 0.9, (255, 215, 50), 2)
+                if recording:
+                    put_text(stab_big, f"[ REC  {len(recorded)}f ]",
+                             (sq - 160, 22), 0.7, (60, 60, 255), 2)
+
+                # Centre stab_big horizontally in the canvas-width panel
+                solo_left = np.full((h, w, 3), 12, dtype=np.uint8)
+                x_off = (w - sq) // 2
+                y_off = (h - sq) // 2
+                solo_left[y_off:y_off + sq, x_off:x_off + sq] = stab_big
+                combined = np.hstack([solo_left, right_panel])
+            else:
+                combined = np.hstack([canvas, right_panel])
 
             # Keep mouse callback aware of layout dimensions
             mouse['canvas_w'] = w
